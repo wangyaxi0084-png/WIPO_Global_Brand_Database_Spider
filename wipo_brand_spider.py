@@ -40,7 +40,9 @@ LOG_FILE = "wipo_spider.log"
 
 # WIPO API 相关常量
 WIPO_BASE_URL = "https://branddb.wipo.int"
-# Search: GET with URL query params → returns HTML results page
+# Primary JSON search endpoint (WIPO Solr-based REST API)
+WIPO_SEARCH_JSON_URL = f"{WIPO_BASE_URL}/branddb/en/search.json"
+# Fallback HTML results page (JSF server-side render)
 WIPO_SEARCH_URL = f"{WIPO_BASE_URL}/branddb/en/results.jsf"
 WIPO_PDF_URL_TEMPLATE = f"{WIPO_BASE_URL}/branddb/trademark/{{key}}/pdf"
 
@@ -61,6 +63,7 @@ REQUEST_DELAY = 2.0          # 每次请求之间的最短间隔（秒）
 RETRY_BASE_DELAY = 10.0      # 首次重试前的等待时间（秒）
 MAX_RETRIES = 5              # 最大重试次数
 BATCH_SIZE = 50              # 每次搜索返回的最大记录数（WIPO 允许最大 50）
+MAX_NUM_FOUND = 100_000      # numFound 合理上限，防止页面中的时间戳等大数字被误判
 
 # ---------------------------------------------------------------------------
 # 日志设置 / Logging
@@ -238,14 +241,24 @@ def _parse_wipo_results_html(html_content: str) -> dict:
 
     # ---- Determine total result count ----
     num_found = len(docs)
-    # Look for patterns like "1 - 50 of 123 results" or "Results: 123"
+    # Look for patterns like "1 - 50 of 123 results" or "Results: 123".
+    # Use targeted capture groups instead of max() over all digits to avoid
+    # accidentally picking up large numbers such as JavaScript timestamps.
     for el in soup.find_all(string=re.compile(r"\bof\s+\d+\b|\bresults?\b", re.I)):
-        nums = re.findall(r"\d+", str(el))
-        if nums:
-            candidate = max(int(n) for n in nums)
-            if candidate >= num_found:
-                num_found = candidate
-                break
+        text = str(el)
+        candidate = None
+        # Preferred pattern: "X - Y of Z" or "of Z results" → capture Z
+        m = re.search(r"\bof\s+(\d+)\b", text, re.I)
+        if m:
+            candidate = int(m.group(1))
+        # Fallback pattern: "Z results" → capture Z
+        if candidate is None:
+            m = re.search(r"\b(\d+)\s+results?\b", text, re.I)
+            if m:
+                candidate = int(m.group(1))
+        if candidate is not None and len(docs) <= candidate <= MAX_NUM_FOUND:
+            num_found = candidate
+            break
 
     logger.debug("HTML 解析结果: %d 条记录，预计总数: %d", len(docs), num_found)
     return {"response": {"numFound": num_found, "docs": docs}}
@@ -254,6 +267,60 @@ def _parse_wipo_results_html(html_content: str) -> dict:
 # ---------------------------------------------------------------------------
 # WIPO API — 搜索
 # ---------------------------------------------------------------------------
+
+def _search_wipo_json(
+    session: requests.Session,
+    brand: str,
+    start: int = 0,
+    rows: int = BATCH_SIZE,
+) -> dict | None:
+    """
+    尝试通过 WIPO JSON REST API 搜索商标。
+
+    WIPO branddb 提供 Solr 风格的 JSON 接口，可直接返回结构化数据，
+    比 HTML 解析更稳定可靠。若请求失败或响应不是有效 JSON 则返回 None。
+    """
+    params = {
+        "brand_name_tm_exact": brand,
+        "sort": "FILING_DATE",
+        "sortType": "desc",
+        "start": str(start),
+        "rows": str(rows),
+    }
+    json_headers = {
+        **DEFAULT_HEADERS,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    try:
+        response = _make_request(
+            session,
+            "GET",
+            WIPO_SEARCH_JSON_URL,
+            params=params,
+            headers=json_headers,
+        )
+        if response.status_code != 200:
+            return None
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "json" not in content_type:
+            return None
+        data = response.json()
+        # Validate expected structure
+        if "response" in data and "docs" in data["response"]:
+            # Apply sanity cap on numFound
+            num_found = data["response"].get("numFound", 0)
+            if num_found > MAX_NUM_FOUND:
+                logger.warning(
+                    "品牌 '%s' JSON API 返回异常 numFound=%d，已截断为 %d",
+                    brand, num_found, MAX_NUM_FOUND,
+                )
+                data["response"]["numFound"] = MAX_NUM_FOUND
+            return data
+    except Exception as exc:
+        logger.debug("JSON API 请求失败 (brand='%s'): %s", brand, exc)
+    return None
+
 
 def search_wipo(
     session: requests.Session,
@@ -265,9 +332,20 @@ def search_wipo(
     """
     搜索 WIPO Global Brand Database。
 
-    使用 GET 请求，带 URL 查询参数。JSF 服务器端渲染 HTML 结果页，
-    由 _parse_wipo_results_html() 解析后返回统一格式字典。
+    优先使用 JSON REST API（更稳定），若不可用则回退到解析 HTML 结果页。
     """
+    time.sleep(request_delay)
+
+    # --- 首选：JSON API ---
+    result = _search_wipo_json(session, brand, start=start, rows=rows)
+    if result is not None:
+        logger.debug(
+            "JSON API 搜索成功 (brand='%s', start=%d, numFound=%d)",
+            brand, start, result["response"].get("numFound", 0),
+        )
+        return result
+
+    # --- 回退：HTML 结果页 ---
     params = {
         "brand_name_tm_exact": brand,
         "sort": "FILING_DATE",
@@ -275,8 +353,6 @@ def search_wipo(
         "start": str(start),
         "rows": str(rows),
     }
-
-    time.sleep(request_delay)
 
     response = _make_request(
         session,
@@ -290,41 +366,44 @@ def search_wipo(
     content_type = response.headers.get("Content-Type", "").lower()
     body = response.text
 
-    # Log response summary for debugging
     logger.debug(
-        "搜索响应: status=%d, content-type=%s, body-length=%d",
+        "HTML 搜索响应: status=%d, content-type=%s, body-length=%d",
         response.status_code, content_type, len(body),
     )
 
     if not body.strip():
         logger.warning(
             "品牌 '%s' 搜索返回空响应 (status=%d)。"
-            "请检查网络或 WIPO 网站是否可访问。",
+            "WIPO 网站可能需要 JavaScript 渲染，建议检查搜索 URL 或改用 JSON API。",
             brand, response.status_code,
         )
         return {"response": {"numFound": 0, "docs": []}}
 
-    # Try JSON (in case the endpoint returns JSON for some requests)
     if "json" in content_type:
         try:
-            return response.json()
+            data = response.json()
+            num_found = data.get("response", {}).get("numFound", 0)
+            if num_found > MAX_NUM_FOUND:
+                logger.warning(
+                    "品牌 '%s' 返回异常 numFound=%d，已截断为 %d",
+                    brand, num_found, MAX_NUM_FOUND,
+                )
+                data["response"]["numFound"] = MAX_NUM_FOUND
+            return data
         except Exception:
             pass
 
-    # Parse HTML (primary path for JSF server-rendered pages)
     if "html" in content_type or body.lstrip().startswith(("<", "<!-")):
         result = _parse_wipo_results_html(body)
-        if result["response"]["docs"] or result["response"]["numFound"] == 0:
-            return result
-        # If we got 0 docs but numFound > 0, log the raw page for investigation
-        logger.warning(
-            "品牌 '%s': HTML 解析到 0 条记录但预计 %d 条。"
-            "响应头部 500 字符: %s",
-            brand, result["response"]["numFound"], body[:500],
-        )
+        if not result["response"]["docs"] and result["response"]["numFound"] > 0:
+            logger.warning(
+                "品牌 '%s': HTML 解析到 0 条记录但预计 %d 条。"
+                "WIPO 页面可能由 JavaScript 动态渲染，静态 HTML 中无数据。"
+                "响应前 200 字符: %.200s",
+                brand, result["response"]["numFound"], body,
+            )
         return result
 
-    # Unexpected response type — log and return empty
     logger.error(
         "品牌 '%s': 无法解析响应 (content-type=%s)。"
         "响应前 500 字符: %s",
