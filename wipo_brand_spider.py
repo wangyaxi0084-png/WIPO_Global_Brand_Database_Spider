@@ -12,6 +12,7 @@ WIPO Global Brand Database Spider
 """
 
 import os
+import re
 import json
 import time
 import logging
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
@@ -38,6 +40,7 @@ LOG_FILE = "wipo_spider.log"
 
 # WIPO API 相关常量
 WIPO_BASE_URL = "https://branddb.wipo.int"
+# Search: GET with URL query params → returns HTML results page
 WIPO_SEARCH_URL = f"{WIPO_BASE_URL}/branddb/en/results.jsf"
 WIPO_PDF_URL_TEMPLATE = f"{WIPO_BASE_URL}/branddb/trademark/{{key}}/pdf"
 
@@ -48,9 +51,8 @@ DEFAULT_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Origin": WIPO_BASE_URL,
     "Referer": f"{WIPO_BASE_URL}/branddb/en/",
 }
 
@@ -173,6 +175,83 @@ def _make_request(
 
 
 # ---------------------------------------------------------------------------
+# WIPO HTML 结果解析
+# ---------------------------------------------------------------------------
+
+def _parse_wipo_results_html(html_content: str) -> dict:
+    """
+    解析 WIPO 搜索结果 HTML 页面，提取商标记录。
+
+    WIPO branddb 是一个 JavaServer Faces (JSF) / PrimeFaces 应用，
+    搜索结果以 HTML DataTable 形式渲染，行上附有 data-rk（row key）属性。
+    返回与 JSON API 兼容的字典格式。
+    """
+    soup = BeautifulSoup(html_content, "lxml")
+    docs: list[dict] = []
+
+    # ---- 1. PrimeFaces DataTable pattern: <tr data-rk="US/1234567"> ----
+    rows = soup.select("tr[data-rk]")
+    for row in rows:
+        key = row.get("data-rk", "").strip()
+        if not key:
+            continue
+        doc: dict = {"key": key}
+        cells = row.find_all("td")
+        for cell in cells:
+            cls = " ".join(cell.get("class", [])).lower()
+            text = cell.get_text(separator=" ", strip=True)
+            if not text:
+                continue
+            if any(x in cls for x in ("brand", "trademark-name", "markname", "name")):
+                doc.setdefault("brandName", text)
+            elif any(x in cls for x in ("office", "country", "jurisdiction")):
+                doc.setdefault("office", text)
+            elif any(x in cls for x in ("registr", "reg-num", "regnumber")):
+                doc.setdefault("registrationNumber", text)
+            elif any(x in cls for x in ("applic", "app-num", "appnumber")):
+                doc.setdefault("applicationNumber", text)
+            elif any(x in cls for x in ("status",)):
+                doc.setdefault("trademarkStatus", text)
+        # Derive missing fields from key (format: OFFICE/NUMBER)
+        if "/" in key:
+            parts = key.split("/", 1)
+            doc.setdefault("office", parts[0])
+            doc.setdefault("registrationNumber", parts[1])
+        docs.append(doc)
+
+    # ---- 2. Fallback: look for links that contain a trademark key pattern ----
+    if not docs:
+        # Trademark detail links often contain the key in href or data attributes
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            # Pattern: /branddb/en/details.jsf?key=US%2F1234567
+            # or data-key attribute on a container element
+            key_match = re.search(r"key=([A-Z]{2,3}%2F[^&\"]+)", href, re.I)
+            if key_match:
+                key = urllib.parse.unquote(key_match.group(1))
+                doc = {"key": key, "brandName": link.get_text(strip=True)}
+                if "/" in key:
+                    parts = key.split("/", 1)
+                    doc["office"] = parts[0]
+                    doc["registrationNumber"] = parts[1]
+                docs.append(doc)
+
+    # ---- Determine total result count ----
+    num_found = len(docs)
+    # Look for patterns like "1 - 50 of 123 results" or "Results: 123"
+    for el in soup.find_all(string=re.compile(r"\bof\s+\d+\b|\bresults?\b", re.I)):
+        nums = re.findall(r"\d+", str(el))
+        if nums:
+            candidate = max(int(n) for n in nums)
+            if candidate >= num_found:
+                num_found = candidate
+                break
+
+    logger.debug("HTML 解析结果: %d 条记录，预计总数: %d", len(docs), num_found)
+    return {"response": {"numFound": num_found, "docs": docs}}
+
+
+# ---------------------------------------------------------------------------
 # WIPO API — 搜索
 # ---------------------------------------------------------------------------
 
@@ -184,40 +263,74 @@ def search_wipo(
     request_delay: float = REQUEST_DELAY,
 ) -> dict:
     """
-    调用 WIPO Global Brand Database 搜索 API。
+    搜索 WIPO Global Brand Database。
 
-    API 使用 POST JSON 方式，查询 Solr 索引。
-    返回原始 JSON 响应字典。
+    使用 GET 请求，带 URL 查询参数。JSF 服务器端渲染 HTML 结果页，
+    由 _parse_wipo_results_html() 解析后返回统一格式字典。
     """
-    query_payload = {
-        "sort": "score desc",
-        "start": start,
-        "rows": rows,
-        "fl": (
-            "key,brandName,imageUrl,trademarkId,office,"
-            "applicationNumber,applicationDate,"
-            "registrationNumber,registrationDate,"
-            "trademarkStatus,trademarkType"
-        ),
-        "highlight": True,
-        "highlightFields": "brandName,niceClass,viennaClass",
-        "filters": [],
-        "facets": [],
-        "query": f"brandName:({urllib.parse.quote(brand)})",
+    params = {
+        "brand_name_tm_exact": brand,
+        "sort": "FILING_DATE",
+        "sortType": "desc",
+        "start": str(start),
+        "rows": str(rows),
     }
 
-    headers = {**DEFAULT_HEADERS, "Content-Type": "application/json"}
     time.sleep(request_delay)
 
     response = _make_request(
         session,
-        "POST",
+        "GET",
         WIPO_SEARCH_URL,
-        json=query_payload,
-        headers=headers,
+        params=params,
+        headers=DEFAULT_HEADERS,
     )
     response.raise_for_status()
-    return response.json()
+
+    content_type = response.headers.get("Content-Type", "").lower()
+    body = response.text
+
+    # Log response summary for debugging
+    logger.debug(
+        "搜索响应: status=%d, content-type=%s, body-length=%d",
+        response.status_code, content_type, len(body),
+    )
+
+    if not body.strip():
+        logger.warning(
+            "品牌 '%s' 搜索返回空响应 (status=%d)。"
+            "请检查网络或 WIPO 网站是否可访问。",
+            brand, response.status_code,
+        )
+        return {"response": {"numFound": 0, "docs": []}}
+
+    # Try JSON (in case the endpoint returns JSON for some requests)
+    if "json" in content_type:
+        try:
+            return response.json()
+        except Exception:
+            pass
+
+    # Parse HTML (primary path for JSF server-rendered pages)
+    if "html" in content_type or body.lstrip().startswith(("<", "<!-")):
+        result = _parse_wipo_results_html(body)
+        if result["response"]["docs"] or result["response"]["numFound"] == 0:
+            return result
+        # If we got 0 docs but numFound > 0, log the raw page for investigation
+        logger.warning(
+            "品牌 '%s': HTML 解析到 0 条记录但预计 %d 条。"
+            "响应头部 500 字符: %s",
+            brand, result["response"]["numFound"], body[:500],
+        )
+        return result
+
+    # Unexpected response type — log and return empty
+    logger.error(
+        "品牌 '%s': 无法解析响应 (content-type=%s)。"
+        "响应前 500 字符: %s",
+        brand, content_type, body[:500],
+    )
+    return {"response": {"numFound": 0, "docs": []}}
 
 
 def get_all_trademarks(
